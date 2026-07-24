@@ -135,40 +135,105 @@ fn send_notification_internal_other(
 }
 
 #[cfg(target_os = "windows")]
+fn copy_balloon_text(target: &mut [u16], value: &str) {
+  let mut offset = 0;
+
+  for character in value.chars() {
+    let mut buffer = [0; 2];
+    let encoded = character.encode_utf16(&mut buffer);
+
+    // Reserve the final element for the null terminator. The
+    // destination was zero-initialized, so no explicit write is needed.
+    if offset + encoded.len() >= target.len() {
+      break;
+    }
+
+    target[offset..offset + encoded.len()].copy_from_slice(encoded);
+    offset += encoded.len();
+  }
+}
+
+#[cfg(target_os = "windows")]
+fn find_registered_tray_window() -> Option<windows::Win32::Foundation::HWND> {
+  use windows::{
+    Win32::{
+      System::Threading::GetCurrentProcessId,
+      UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId},
+    },
+    core::{PCWSTR, w},
+  };
+
+  let current_process_id = unsafe { GetCurrentProcessId() };
+  let mut previous = None;
+
+  loop {
+    let hwnd = unsafe {
+      FindWindowExW(
+        None,
+        previous,
+        w!("tray_icon_app"),
+        PCWSTR::null(),
+      )
+    }
+    .ok()?;
+
+    let mut owner_process_id = 0;
+    unsafe {
+      GetWindowThreadProcessId(hwnd, Some(&mut owner_process_id));
+    }
+
+    if owner_process_id == current_process_id {
+      return Some(hwnd);
+    }
+
+    previous = Some(hwnd);
+  }
+}
+
+#[cfg(target_os = "windows")]
+fn show_tray_balloon(title: &str, body: &str) -> Result<(), String> {
+  use windows::Win32::UI::Shell::{
+    NIF_INFO, NIIF_NOSOUND, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW,
+  };
+
+  let hwnd = find_registered_tray_window()
+    .ok_or_else(|| "Dorion's registered tray window was not found".to_string())?;
+
+  let mut notification = NOTIFYICONDATAW {
+    cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+    hWnd: hwnd,
+
+    // tray-icon 0.24.1 uses a process-local counter starting at
+    // one, and Dorion creates exactly one tray icon.
+    uID: 1,
+
+    uFlags: NIF_INFO,
+    dwInfoFlags: NIIF_NOSOUND,
+    ..unsafe { std::mem::zeroed() }
+  };
+
+  copy_balloon_text(&mut notification.szInfoTitle, title);
+  copy_balloon_text(&mut notification.szInfo, body);
+
+  if unsafe { Shell_NotifyIconW(NIM_MODIFY, &notification) }.as_bool() {
+    Ok(())
+  } else {
+    Err("Shell_NotifyIconW(NIM_MODIFY) returned FALSE".to_string())
+  }
+}
+
+#[cfg(target_os = "windows")]
 fn send_notification_internal_windows(
-  app: &tauri::AppHandle,
+  _app: &tauri::AppHandle,
   title: String,
   body: String,
-  icon: String,
-  additional_data: Option<AdditionalData>,
+  _icon: String,
+  _additional_data: Option<AdditionalData>,
 ) {
-  use std::path::Path;
-  use tauri_winrt_notification::{IconCrop, Toast};
-
-  let win = app.get_webview_window("main");
-
-  let mut toast = Toast::new(&app.config().identifier)
-    .icon(Path::new(&icon), IconCrop::Circular, "")
-    .title(title.as_str())
-    .text2(body.as_str())
-    .sound(None);
-
-  if let Some(data) = &additional_data {
-    toast = toast.on_activated({
-      let additional_data = additional_data.clone();
-
-      move |_s| {
-        if let (Some(win), Some(data)) = (&win, &additional_data) {
-          open_notification_data(win, Some(data.clone()));
-        }
-        Ok(())
-      }
-    });
+  if let Err(error) = show_tray_balloon(&title, &body) {
+    log!("Failed to send tray balloon notification: {}", error);
   }
-
-  toast
-    .show()
-    .unwrap_or_else(|e| log!("Failed to send notification: {:?}", e));
 }
 
 #[cfg(target_os = "windows")]
